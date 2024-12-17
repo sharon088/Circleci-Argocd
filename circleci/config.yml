@@ -1,0 +1,276 @@
+version: 2.1
+orbs:
+  slack: circleci/slack@5.1.1
+  aws-cli: circleci/aws-cli@5.1.1
+jobs:
+  build_push:
+    docker:
+      - image: cimg/base:2024.11
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build Docker Image
+          command: docker build -t sharon088/weather-webapp:${CIRCLE_BUILD_NUM} .
+      - run:
+          name: Run Docker Image
+          command: docker run --rm -d -p 8000:8000 sharon088/weather-webapp:${CIRCLE_BUILD_NUM}
+      - run:
+          name: Check App Connectivity
+          command: |
+            sleep 5
+            container_id=$(docker ps -q -f "ancestor=sharon088/weather-webapp:${CIRCLE_BUILD_NUM}")
+            container_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $container_id)
+            if ! curl -s -o /dev/null -w "%{http_code}" http://$container_ip:8000 | grep 200; then
+              echo "App is not reachable. Exiting.";
+              exit 1;
+            fi
+
+      - slack/notify:
+          channel: circleci-proj
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Build Status:* :white_check_mark: Build #${CIRCLE_BUILD_NUM} succeeded"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*App Connectivity Test:* :white_check_mark: Passed"
+                    }
+                  ]
+                }
+              ]
+            }
+          event: pass
+
+      - slack/notify:
+          channel: circleci-proj
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Build Status:* :x: Build #${CIRCLE_BUILD_NUM} failed"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Error Details:* Please check the logs."
+                    }
+                  ]
+                }
+              ]
+            }
+          event: fail
+
+      - run:
+          name: Log in to GitLab Container Registry
+          command: echo $GITLAB_PASSWORD | docker login $CI_REGISTRY -u $GITLAB_LOGIN --password-stdin
+      - run:
+          name: Tag Docker Image for GitLab Container Registry
+          command: docker tag sharon088/weather-webapp:${CIRCLE_BUILD_NUM} registry.gitlab.com/goofy5284446/circleci-proj:${CIRCLE_BUILD_NUM}
+      - run:
+          name: Push Docker Image to GitLab Container Registry
+          command: docker push registry.gitlab.com/goofy5284446/circleci-proj:${CIRCLE_BUILD_NUM}
+
+  checkov:
+    docker:
+      - image: circleci/python:3.9.4
+    steps:
+      - checkout
+      - run:
+          name: Install Checkov
+          command: pip install checkov
+      - run:
+          name: Run Checkov on Terraform files
+          command: checkov -d /terraform --quiet
+
+  terratest:
+    docker:
+      - image: cimg/go:1.23.3
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: Install Tofu Binaries
+          command: |
+            curl -Lo tofu.tar.gz https://github.com/opentofu/opentofu/releases/download/v1.8.5/tofu_1.8.5_linux_amd64.tar.gz
+            tar -xzf tofu.tar.gz
+            chmod +x tofu
+            sudo mv tofu /usr/local/bin/
+
+      - run:
+          name: Install dependencies
+          command: |
+            cd terraform/test
+            go mod init gitlab.com/goofy5284446/circleci-proj
+            go mod tidy
+
+      - run:
+          name: Run Terratest
+          command: |
+            cd terraform/test
+            go test -v -timeout 30m
+
+  eks_cluster:
+    docker:
+      - image: cimg/deploy:2024.11.1
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: Initialize Terraform
+          command: |
+            cd terraform
+            terraform init
+      - run:
+          name: Create EKS Cluster
+          command: |
+            cd terraform
+            terraform apply -auto-approve
+          timeout: 30m
+
+  deploy_argocd:
+    docker:
+      - image: cimg/base:2024.11
+    steps:
+      - checkout
+      - aws-cli/setup
+      - aws-eks/setup
+      - kubernetes/install-kubectl
+      - run:
+          name: Create Kubeconfig
+          command: aws eks --region $AWS_DEFAULT_REGION update-kubeconfig --name eks-cluster
+      - run:
+          name: Install ArgoCD CLI
+          command: |
+            curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+            sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+            rm argocd-linux-amd64
+      - run:
+          name: Install ArgoCD
+          command: |
+            kubectl create namespace argocd || echo "Namespace 'argocd' already exists"
+            kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+            kubectl wait --for=condition=available --timeout=600s deployment/argocd-server -n argocd
+      - run:
+          name: Fetch ArgoCD Password
+          command: |
+            export ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)
+            echo "ARGOCD_PASSWORD=$ARGOCD_PASSWORD" >> $BASH_ENV
+            echo ArgoCD Password: $ARGOCD_PASSWORD
+      - run:
+          name: Fetch ArgoCD API server
+          command: |
+            kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+            until kubectl get svc argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' | grep -v '<pending>'; do
+              echo "Waiting for LoadBalancer IP to be assigned..."
+              sleep 10
+            done
+            export ARGOCD_SERVER=$(kubectl get svc argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            echo "ARGOCD_SERVER=$ARGOCD_SERVER" >> $BASH_ENV
+      - run:
+          name: Login to ArgoCD
+          command: |
+            sleep 30
+            argocd login $ARGOCD_SERVER --username $ARGOCD_USERNAME --password $ARGOCD_PASSWORD --insecure
+      - run:
+          name: Add repo to ArgoCD
+          command: argocd repo add $K8S_REPO_URL --username $CI_REGISTRY_USER --password $CI_REGISTRY_PASSWORD
+      - run:
+          name: Login to Docker registry
+          command: docker login registry.gitlab.com -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
+      - run:
+          name: Create secret for GiLab registry
+          command: |
+            kubectl get secret regcred --ignore-not-found -o name || \
+              kubectl create secret generic regcred --from-file=.dockerconfigjson=$HOME/.docker/config.json \
+                --type=kubernetes.io/dockerconfigjson
+      - run:
+          name: Create app in ArgoCD
+          command: |
+            argocd app create weather-webapp --repo $K8S_REPO_URL --path . \
+              --dest-server https://kubernetes.default.svc --dest-namespace argocd || \
+            argocd app set weather-webapp --repo $K8S_REPO_URL --path .
+      - run:
+          name: Sync application for deployment
+          command: argocd app sync weather-webapp
+      - run:
+          name: Enable application auto-sync
+          command: argocd app set weather-webapp --sync-policy automated --sync-option CreateNamespace=true
+      - run:
+          name: Validate Deployment
+          command: |
+            sleep 180
+            kubectl get svc -n argocd
+            kubectl get pods -o wide -n argocd
+
+            
+  chaos_monkey:
+    docker:
+      - image: cimg/base:2024.11
+    steps:
+      - checkout
+      - aws-cli/setup
+      - aws-eks/setup
+      - kubernetes/install-kubectl
+      - run:
+          name: Create Kubeconfig
+          command: aws eks --region $AWS_DEFAULT_REGION update-kubeconfig --name eks-cluster
+      - run:
+        name: Install Helm
+        command: |
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod 700 get_helm.sh
+          ./get_helm.sh
+    - run:
+        name: Install Kube-Monkey
+        command: |
+          helm repo add kubemonkey https://asobti.github.io/kube-monkey/charts/repo
+          helm repo update
+          helm install kube-monkey kubemonkey/kube-monkey --version 1.5.2 \
+            --namespace argocd \
+            --set config.dryRun=false \
+            --set config.whitelistedNamespaces="[default]" \
+            --set config.scheduleInterval="1m" \
+            --set config.debug.enabled=true \
+            --set config.debug.schedule_immediate_kill=true
+    - run:
+        name: View Kube-Monkey status
+        command: |
+          sleep 120
+          echo "Kube-Monkey Termination Results:"
+          kubectl get pods --namespace chaos-monkey
+    - run:
+        name: Stop Kube-Monkey
+        command: helm uninstall kube-monkey
+
+workflows:
+  version: 2
+  weather_webapp:
+    jobs:
+      - build_push:
+          context: slack-secrets
+      - checkov
+      - terratest:
+          requires:
+            - checkov
+      - eks_cluster:
+          requires:
+            - terratest
+      - deploy_argocd:
+          requires:
+            - eks_cluster
+      - chaos_monkey:
+          requires:
+            - deploy_argocd
+
+
+

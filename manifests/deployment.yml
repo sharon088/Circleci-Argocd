@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+    spec:
+      containers:
+      - name: webapp
+        image: registry.gitlab.com/goofy5284446/circleci-proj:93
+        ports:
+        - containerPort: 8000
+      imagePullSecrets:
+        - name: regcredt
+
