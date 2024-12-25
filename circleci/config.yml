@@ -110,7 +110,7 @@ jobs:
           name: Install dependencies
           command: |
             cd terraform/test
-            go mod init gitlab.com/goofy5284446/circleci-proj
+            go mod init gitlab.com/sharon088/weather-webapp/
             go mod tidy
 
       - run:
