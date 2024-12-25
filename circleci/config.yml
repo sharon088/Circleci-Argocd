@@ -75,10 +75,10 @@ jobs:
           command: echo $GITLAB_PASSWORD | docker login $CI_REGISTRY -u $GITLAB_LOGIN --password-stdin
       - run:
           name: Tag Docker Image for GitLab Container Registry
-          command: docker tag sharon088/weather-webapp:${CIRCLE_BUILD_NUM} registry.gitlab.com/goofy5284446/circleci-proj:${CIRCLE_BUILD_NUM}
+          command: docker tag sharon088/weather-webapp:${CIRCLE_BUILD_NUM} registry.gitlab.com/sharon088/weather-webapp:${CIRCLE_BUILD_NUM}
       - run:
           name: Push Docker Image to GitLab Container Registry
-          command: docker push registry.gitlab.com/goofy5284446/circleci-proj:${CIRCLE_BUILD_NUM}
+          command: docker push registry.gitlab.com/sharon088/weather-webapp:${CIRCLE_BUILD_NUM}
 
   checkov:
     docker:
